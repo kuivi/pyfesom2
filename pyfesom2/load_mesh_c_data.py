@@ -365,11 +365,15 @@ class fesom_c_station(object):
         fesom_c station object
     """    
     def __init__(self, fname):
+
         self.fname = os.path.abspath(fname)
         self.path  = os.path.dirname(fname)
-        
         if not os.path.exists(fname):
             raise IOError('The file "{}" does not exists'.format(fname))
+        
+        fname_base = os.path.basename(fname)
+        fname_name = os.path.splitext(fname_base)[0]
+        self.name = fname_name        
 
         self.readstat()
         
@@ -382,20 +386,31 @@ class fesom_c_station(object):
         aux = ['time','sigma_lev','depth','lon','lat','nv','depth','lon_elem','lat_elem',
                'elem_area','depth_elem','area','w_cv','nod_in_elem2d_num','nod_in_elem2d']
         #aux_add = ['fvcoastal_mesh']
-        fname = self.fname
+        fname = self.fname       
         ncf = Dataset(fname,'r')
         mtime_raw = ncf.variables['time'][:]
         a = ncf.variables['time'].getncattr('units')
         self.mtime = num2date(mtime_raw,a)   
         self.mtimec = np.array([t.timestamp() for t in self.mtime])
         self.sigma_lev = loadvar('sigma_lev') # sigma levels
-        self.nlev = len(self.sigma_lev)
         self.depth = loadvar('depth') #depth on node
-        self.z0 = self.depth*(1-self.sigma_lev) #depth of sigma level on node
-        self.z0m1 = (self.z0[0:-1]+self.z0[1:])/2.0 #depth of sigma-m1 level on node
         self.depth_elem = loadvar('depth_elem')  #depth on element
-        self.z0e = self.depth_elem*(1-self.sigma_lev)  #depth of sigma level on element      
-        self.z0em1 = (self.z0e[0:-1]+self.z0e[1:])/2.0 #depth of sigma-1 level on element
+        
+        if hasattr(self, 'sigma_lev'):
+            self.nlev = len(self.sigma_lev)
+            if hasattr(self, 'depth'):
+                self.z0 = self.depth*(1-self.sigma_lev) #depth of sigma level on node
+                self.z0m1 = (self.z0[0:-1]+self.z0[1:])/2.0 #depth of sigma-m1 level on node
+            else:
+                print('station nc file does ont have depth variable, some plotting will fail')
+            if hasattr(self, 'depth_elem'):
+                self.z0e = self.depth_elem*(1-self.sigma_lev)  #depth of sigma level on element      
+                self.z0em1 = (self.z0e[0:-1]+self.z0e[1:])/2.0 #depth of sigma-1 level on element
+            else:
+                print('station nc file does ont have depth variable, some plotting will fail')
+        else:
+            print('station nc file does ont have sigma_lev variable, some plotting will fail')
+            
         self.x2 = loadvar('lon')
         self.y2 = loadvar('lat')
         self.elem = loadvar('nv')
@@ -423,6 +438,40 @@ class fesom_c_station(object):
         ncf.close()    
         return data
 
+    def get_datat1sigma(self,var,sigma,**kwargs):
+        # mesh is a station, will read "var" variable
+        # read data from one sigma level
+        # no interpolation is done here
+        # sigma in te model from 1 to ...
+        # sigma index in arrays are from 0 to ...
+        # tstart  - index of time to start
+        # tend  - index of time to end
+        
+        if ('tstart' in kwargs.keys()):
+            tstart = kwargs['tstart']
+        else:
+            tstart = 0
+        if ('tend' in kwargs.keys()):
+            tend = kwargs['tend']
+        else:
+            tend = len(self.mtime)
+            
+        ncf = Dataset(self.fname,'r')                   #-- add data file
+        if (ncf.variables[var].ndim != 3):
+            raise IOError('The variable "{}" is not 2d variable.'.format(var)) 
+        sigmDim = ncf.variables[var].shape[2]
+        if (sigma > sigmDim):
+            raise IOError('Sigma index exceeds dimension bounds of variable "{}".'.format(var))
+        z = -999
+        if (sigmDim == self.nlev):
+            z = self.z0[sigma-1]
+        elif (sigmDim == self.nlev -1):
+            z = self.z0m1[sigma-1]            
+            
+        data = ncf.variables[var][tstart:tend,0,sigma-1].data
+        ncf.close()            
+        return data, z    
+
     def get_varparam(self,var):
         # mesh is a station, will read "var" standard_name and units
         ncf = Dataset(self.fname,'r')
@@ -438,8 +487,9 @@ class fesom_c_station(object):
         ncf.close()    
         return {'standard_name':standard_name, 'units':units}
     
-    def contourfz0(self,var):
+    def contourfz0(self,var,figsize=(10, 7),dpi=90):
         # read "var" variable
+        # var - is mandatory (name of variable to plot)
         # contourf (Hovmöller) var
         # no interpolation is done here
         if not (var in self.varlist):
@@ -454,7 +504,7 @@ class fesom_c_station(object):
         else:
             raise IOError('The data shape is not Nsigma or Nsigma-1 shape="{}"'.format(data.shape)) 
         cmap = select_cmap(var)    
-        fig, axes = plt.subplots(nrows=1, ncols=1,figsize=(15, 10), dpi=90)
+        fig, axes = plt.subplots(nrows=1, ncols=1,figsize=figsize, dpi=dpi)
         od = axes.contourf(self.mtime, z, data,
                   cmap=cmap)
 #                  levels=np.linspace(cmin, cmax, 100),
@@ -471,12 +521,132 @@ class fesom_c_station(object):
         cbar = fig.colorbar(od, aspect=40)
 #                        ticks=np.linspace(np.round(cmin,1),np.round(cmax,1),7))  
         cbar.ax.tick_params(labelsize=18)
-        axes.set_title(dparam['standard_name']+', '+dparam['units'],fontsize=18)
+        title = 'Station: '+self.name+', '+dparam['standard_name']+', '+dparam['units']
+        axes.set_title(title,fontsize=18)
         axes.invert_yaxis()
         fig.autofmt_xdate()
         axes.autoscale_view()                
         return {'fig': fig, 'axes':axes, 'contourf':od}
     
+    def plotsigma(self,var,sigma,figsize=(12, 7),dpi=90):
+        # make a plot of variable on defined sigma level
+        # read "var" variable
+        # var - is mandatory (name of variable to plot)
+        # contourf (Hovmöller) var
+        # no interpolation is done here
+        # model sigma is use , starting from 1 to ...
+        if not (var in self.varlist):
+            raise IOError('The variable "{}" is not in station nc file.'.format(var)) 
+        
+        data, z0 = self.get_datat1sigma(var,sigma)
+        dparam = self.get_varparam(var)
+        fig, axes = plt.subplots(nrows=1, ncols=1,figsize=figsize, dpi=dpi)
+        od = axes.plot(self.mtime, data)
+        axes.grid(color='k', alpha=0.5, linestyle='--')
+        axes.set_xlabel('Time',fontsize=18)    
+        axes.tick_params(labelsize=18)
+        axes.set_ylabel(dparam['standard_name']+', '+dparam['units'],fontsize=18)    
+        title = 'Station: '+self.name+'; '+dparam['standard_name']+', '+dparam['units']
+        title = title + '; Sigma level: '+str(sigma)+'; Z_0: '+str(round(z0,2)) 
+        axes.set_title(title,fontsize=18)
+        #axes.invert_yaxis()
+        fig.autofmt_xdate()
+        axes.autoscale_view()                
+        return {'fig': fig, 'axes':axes, 'plot':od}
+
+    def plotsigmas(self,var,sigmas,figsize=(12, 14),dpi=90,**kwargs):
+        # make a plot of variable on defined sigma level
+        # read "var" variable
+        # var - is mandatory (name of variable to plot)
+        # contourf (Hovmöller) var
+        # no interpolation is done here
+        # model sigma is use , starting from 1 to ...
+        # tstart - first time step to plot
+        # tend - last time step to plot
+        
+        if ('tstart' in kwargs.keys()):
+            tstart = kwargs['tstart']
+        else:
+            tstart = 0
+        if ('tend' in kwargs.keys()):
+            tend = kwargs['tend']
+        else:
+            tend = len(self.mtime)
+
+        if not (var in self.varlist):
+            raise IOError('The variable "{}" is not in station nc file.'.format(var)) 
+            
+        nsigma = len(sigmas)
+        if nsigma == 1:
+            pl = self.plot1sigma(var,sigmas[0],figsize=figsize,dpi=dpi)
+            return pl
+          
+        dparam = self.get_varparam(var)
+        nsigma = len(sigmas)
+        fig, axess = plt.subplots(nrows=nsigma, ncols=1,figsize=figsize, dpi=dpi)        
+        plots = []
+        for sigma,axes in zip(sigmas,axess):
+            data, z0 = self.get_datat1sigma(var,sigma,tstart=tstart,tend=tend)
+            plots.append(axes.plot(self.mtime[tstart:tend], data))
+            axes.grid(color='k', alpha=0.5, linestyle='--')
+            #axes.set_xlabel('Time',fontsize=18)    
+            axes.tick_params(labelsize=18)
+            #axes.set_ylabel(dparam['standard_name']+', '+dparam['units'],fontsize=18)    
+            title = 'Sigma level: '+str(sigma)+'; Z_0: '+str(round(z0,2)) 
+            axes.set_title(title,fontsize=18)
+            #axes.invert_yaxis()
+            fig.autofmt_xdate()
+            axes.autoscale_view()                
+
+        fig.text(0.5, 0.01, 'Time', ha='center',fontsize=18)
+        fig.text(0.01, 0.5, dparam['standard_name']+', '+dparam['units'],fontsize=18
+                 , va='center', rotation='vertical')
+        title = 'Station: '+self.name+'; '+dparam['standard_name']+', '+dparam['units']
+        fig.suptitle(title,fontsize=18)    
+        return {'fig': fig, 'axes':axess, 'plot':plots}
+
+    def plotsigmavars(self,vara,sigma,figsize=(12, 14),dpi=90,**kwargs):
+        # make a plot of several variables on defined sigma level
+        # read "var" variable
+        # var - is mandatory (name of variable to plot)
+        # no interpolation is done here
+        # model sigma is use , starting from 1 to ...
+        # tstart - first time step to plot
+        # tend - last time step to plot
+        
+        if ('tstart' in kwargs.keys()):
+            tstart = kwargs['tstart']
+        else:
+            tstart = 0
+        if ('tend' in kwargs.keys()):
+            tend = kwargs['tend']
+        else:
+            tend = len(self.mtime)
+            
+        nvar = len(vara)        
+        for var in vara:
+            if not (var in self.varlist):
+                raise IOError('The variable "{}" is not in station nc file.'.format(var)) 
+
+        fig, axess = plt.subplots(nrows=nvar, ncols=1,figsize=figsize, dpi=dpi)        
+        plots = []
+        for var,axes in zip(vara,axess):
+            data, z0 = self.get_datat1sigma(var,sigma,tstart=tstart,tend=tend)
+            plots.append(axes.plot(self.mtime[tstart:tend], data))
+            axes.grid(color='k', alpha=0.5, linestyle='--')
+            #axes.set_xlabel('Time',fontsize=18)    
+            axes.tick_params(labelsize=18)
+            dparam = self.get_varparam(var)
+            axes.set_ylabel(var+', '+dparam['units'],fontsize=18)    
+            #title = 'Sigma level: '+str(sigma)+'; Z_0: '+str(round(z0,2)) 
+            #axes.set_title(title,fontsize=18)
+            axes.autoscale_view()                
+            
+        fig.autofmt_xdate()    
+        fig.text(0.5, 0.01, 'Time', ha='center',fontsize=18)
+        title = 'Station: '+self.name+'; '+ 'Sigma level: '+str(sigma)+'; Z_0: '+str(round(z0,2)) 
+        fig.suptitle(title,fontsize=18)    
+        return {'fig': fig, 'axes':axess, 'plot':plots}
     
 def select_cmap(var):
     if (var in cmap_dict):
