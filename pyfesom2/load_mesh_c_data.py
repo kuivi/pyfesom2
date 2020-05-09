@@ -16,9 +16,15 @@ import os
 import logging
 import time
 from netCDF4 import num2date
+#from cftime import  num2pydate
+import datetime
 import matplotlib.pyplot as plt
 import joblib
 import pickle
+import pyresample
+import nc_time_axis
+from   matplotlib.patches import Polygon
+from matplotlib.collections import PatchCollection
 
 import importlib
 # construct dictionary with colormaps for variables
@@ -61,7 +67,7 @@ else:
      }    
         
 
-def load_c_mesh(path, exp = "", usepickle=False, usejoblib=False, protocol=4):
+def load_c_mesh(path, exp = "", usepickle=False, usejoblib=False, protocol=4, addpolygons=False):
     """ Loads FESOM-C mesh
 
     Parameters
@@ -132,7 +138,7 @@ def load_c_mesh(path, exp = "", usepickle=False, usejoblib=False, protocol=4):
         print("The joblib file for FESOM_C DO NOT exists")
         print("The mesh will be saved to {}".format(joblib_file))
 
-        mesh = fesom_c_mesh(path=path, exp=exp)
+        mesh = fesom_c_mesh(path=path, exp=exp, addpolygons=False)
         logging.info("Use joblib to save the mesh information")
         print("Save mesh to binary format")
         joblib.dump(mesh, joblib_file)
@@ -156,9 +162,7 @@ def load_c_station(fname):
     station = fesom_c_station(fname)
     return station
 
-
-
-    
+  
     
 class fesom_c_mesh(object):
     """ Creates instance of the FESOM-C mesh.
@@ -211,7 +215,7 @@ class fesom_c_mesh(object):
         fesom_mesh object
     """
 
-    def __init__(self, path, exp=""):
+    def __init__(self, path, exp="", addpolygons=False):
         #add type of mesh
         self.type = 'fesom_c'
 
@@ -252,14 +256,26 @@ class fesom_c_mesh(object):
             self.ncfile = os.path.join(path)            
 
         logging.info("load 2d part of the mesh")
-        start = time.clock()
+        #start = time.clock()
         if useascii:
             self.read2d()
         else:
             self.read2d_nc()
-        end = time.clock()
-        print("Load 2d part of the mesh in {} second(s)".format(str(int(end - start))))
-
+        # add table of elements with coordinates    
+        self.elem_x = self.x2[self.elem-1]
+        self.elem_y = self.y2[self.elem-1] 
+        # add polygons of mesh (could take time for huge meshes , and  MEMORY)
+        if (addpolygons):
+            self.addpolygons() 
+            
+        #end = time.clock()
+        #print("Load 2d part of the mesh in {} second(s)".format(str(int(end - start))))
+    def addpolygons(self):
+        p=[Polygon(np.vstack((self.elem_x[i], self.elem_y[i])).T,closed=True) 
+                        for i in range(self.e2d)]
+        self.patches = p
+        return
+       
     def read2d(self):
         # funcion to read mesh files for FESOM-C branch, 
         # * it has 4 nodes elements in each element
@@ -325,6 +341,7 @@ class fesom_c_mesh(object):
         self.topo =  loadvar('depth')
         self.x2_e = loadvar('lon_elem')
         self.y2_e = loadvar('lat_elem')
+        self.topo_e =  loadvar('depth_elem')
         self.sigma_lev = loadvar('sigma_lev')
         self.topo_e = loadvar('depth_elem')
         self.area = loadvar('area')
@@ -332,10 +349,199 @@ class fesom_c_mesh(object):
         self.w_cv = loadvar('w_cv')
         self.nod_in_elem2d_num = loadvar('nod_in_elem2d_num')
         self.nod_in_elem2d = loadvar('nod_in_elem2d')
+            #time
+        mtime_raw = ncf.variables['time'][:]
+        a = ncf.variables['time'].getncattr('units')
+        self.mcftime = num2date(mtime_raw,a)   
+        self.mtime = [datetime.datetime(year=b.year,month=b.month,day=b.day,
+                                        hour=b.hour,minute=b.minute,second=b.second,
+                                        microsecond=b.microsecond) for b in self.mcftime]
+        self.mtimec = np.array([t.timestamp() for t in self.mtime])
+        self.e2d = np.shape(self.elem)[0]
+        self.n2d = len(self.x2)
         ncf.close()
 
         return self
+    
 
+
+        
+def plotpatches(mesh, data, figsize=(10, 7), dpi=90, title="", var="",
+                  vmin=None,vmax=None,cont=None, Nlev=21, edge="face",linewidth=0.8):
+    # if no patches were done, do it first time and add to mesh
+    if not hasattr(mesh, 'patches'):
+        mesh.addpolygons()
+    d = data.copy()
+    if (vmin==None):
+        vmin = np.nanmin(data)
+    if (vmax==None):
+        vmax = np.nanmax(data)
+    d[d>vmax] = vmax
+    d[d<vmin] = vmin
+    cmap = select_cmap(var)    
+    fig, axes = plt.subplots(nrows=1, ncols=1,figsize=figsize, dpi=dpi)
+    p = PatchCollection(mesh.patches,linewidth=linewidth)    
+    plot = axes.add_collection(p)
+    plot.set_array(d)
+    plot.set_edgecolor(edge)  
+    plot.set_clim(vmin,vmax)
+    axes.grid(color='k', alpha=0.5, linestyle='--')
+    axes.set_xlabel(r'$Longitude, [\degree]$',fontsize=18)  
+    axes.set_ylabel(r'$Latitude, [\degree]$',fontsize=18)  
+    axes.tick_params(labelsize=18)
+    cbar = fig.colorbar(plot, aspect=40,
+                        ticks=np.linspace(vmin,vmax,7))  
+    cbar.ax.tick_params(labelsize=18)
+    axes.set_title(title,fontsize=18)
+    fig.autofmt_xdate()
+    axes.autoscale_view()                
+    return {'fig': fig, 'axes':axes, 'plot':plot}       
+        
+def read_fesomc_slice(
+        fname,
+        var,
+        records,
+        how="mean"
+        ):
+    ncf = Dataset(fname)
+    if (type(records) == int):
+        data = ncf.variables[var][records,:,:].data
+    else:    
+        if how == "mean":
+            data = ncf.variables[var][records,:,:].data.mean(axis=0)
+        elif how == "max":
+            data = ncf.variables[var][records,:,:].data.max(axis=0)
+        elif how == "min":
+            data = ncf.variables[var][records,:,:].data.min(axis=0)
+    ncf.close()
+    return data
+
+def sigma2z3d(data,mesh,z):
+    #function for interpolation of 3d data on sigma level to 3d z levels
+    #z levels are calculated from bathymerty (topo) and sigma distribution
+    #if you nead real depth have a look on zbar variable in nc output
+    if (mesh.x2.shape[0] == data.shape[0]):
+        topo = mesh.topo
+    elif (mesh.x2_e.shape[0] == data.shape[0]):
+        topo = mesh.topo_e
+    else:
+        raise IOError('Shape of data "{}" does not fit to nodes or elements'.format(data.shape))
+    s,d = np.meshgrid((1-mesh.sigma_lev),topo)
+    z0 = d*s #2d array with z levels at each node
+    if data.shape[1] <len(mesh.sigma_lev):
+        z0 = (z0[:,0:-1]+z0[:,1:])/2.0
+    data_intp = np.zeros((data.shape[0],len(z)))
+    data_intp[:,:] = np.nan
+    #z_intp = np.zeros(data.shape[0])
+    for i in range(data.shape[0]):
+        zind = np.where(z < topo[i])[0][-1]+2
+        data_intp[i,:zind] = np.interp(z[:zind],z0[i,:],data[i,:])
+        #z_intp[i] = zind
+    return data_intp    
+
+def read_fesomc_sect(
+        fname,
+        mesh,
+        var,
+        records,
+        p1,
+        p2,
+        how="mean",        
+        Nz=30,
+        N=100,
+        radius_of_influence=5000,
+        neighbours=10):        
+# set the number of descrete points in horizontal and vertical (N and nz, respectively) to represent the section
+    
+    sx = np.linspace(p1[0], p2[0], N)
+    sy = np.linspace(p1[1], p2[1], N)
+    sz = np.zeros([N, Nz])
+    sz[:,:] = np.nan
+    
+    z = np.linspace(1,mesh.topo.max(),Nz)
+    data =  read_fesomc_slice(fname, var, records, how=how)
+    data_intp = sigma2z3d(data,mesh,z)    
+    if (mesh.x2.shape[0] == data.shape[0]):
+        lons = mesh.x2
+        lats = mesh.y2
+    elif (mesh.x2_e.shape[0] == data.shape[0]):
+        lons = mesh.x2_e
+        lats = mesh.y2_e
+    else:
+        raise IOError('Shape of data "{}" does not fit to nodes or elements'.format(data.shape))
+            
+    oce_ind2d = np.ones(lons.shape)
+    orig_def = pyresample.geometry.SwathDefinition(lons=lons, lats=lats)
+    targ_def = pyresample.geometry.SwathDefinition(lons=sx, lats=sy)
+    oce_mask = pyresample.kd_tree.resample_nearest(
+            orig_def,
+            oce_ind2d,
+            targ_def,
+            radius_of_influence=radius_of_influence,
+            fill_value=0.0,
+            )
+    for ilev in range(Nz):
+        sz[:,ilev] = (
+                pyresample.kd_tree.resample_gauss(
+                        orig_def,
+                        data_intp[:,ilev],
+                        targ_def,
+                        radius_of_influence=radius_of_influence,
+                        neighbours=neighbours,
+                        sigmas=250000,
+                        fill_value=np.nan,
+                        )
+                * oce_mask
+                )
+    return (sx, sy, sz, z)
+                
+def contourf_sect(X, Z, data, figsize=(10, 7),dpi=90,axis="x",var="", title="",
+                  vmin=None,vmax=None,cont=None, Nlev=21):
+    # read "var" variable
+    # var - is mandatory (name of variable to plot)
+    # contourf (Hovmöller) var
+    # no interpolation is done here
+    #if not (var in mesh.varlist):
+    #    raise IOError('The variable "{}" is not in station nc file.'.format(var)) 
+    d = data.copy()
+    if (vmin==None):
+        vmin = np.nanmin(data)
+    if (vmax==None):
+        vmax = np.nanmax(data)
+    d[d>vmax] = vmax
+    d[d<vmin] = vmin
+    cmap = select_cmap(var)    
+    if (axis == "y"):
+        xlabel = r'$Latitude, [\degree]$'        
+    else:
+        xlabel = r'$Longitude, [\degree]$'
+        
+    fig, axes = plt.subplots(nrows=1, ncols=1,figsize=figsize, dpi=dpi)
+    plot = axes.contourf(X, Z, d, cmap=cmap,
+                  levels=np.linspace(vmin, vmax, Nlev))
+    if (cont!=None):
+        if (cont==0):
+            plot2 = axes.contour(X, Z, d,'-k', levels=[0])
+        else:
+            plot2 = axes.contour(X, Z, d,'--', levels=np.linspace(vmin, vmax, 7))
+    plot.set_clim(vmin,vmax)
+#        axes.set_xlim(t.min(),t.max())
+#        axes.set_ylim(mz.max().round(),0)
+    axes.grid(color='k', alpha=0.5, linestyle='--')
+    axes.set_xlabel(xlabel,fontsize=18)    
+    axes.tick_params(labelsize=18)
+    axes.set_ylabel('Depth, [m]',fontsize=18)    
+    #axes[0].xaxis.set_tick_params(labelsize=fs)
+    #axes[0].yaxis.set_tick_params(labelsize=fs)
+    cbar = fig.colorbar(plot, aspect=40,
+                        ticks=np.linspace(vmin,vmax,7))  
+    cbar.ax.tick_params(labelsize=18)
+    axes.set_title(title,fontsize=18)
+    axes.invert_yaxis()
+    fig.autofmt_xdate()
+    axes.autoscale_view()                
+    return {'fig': fig, 'axes':axes, 'contourf':plot}       
+        
 class fesom_c_station(object):
     """ Creates instance of the FESOM-C station.
     This class creates instance that contain information
@@ -390,7 +596,10 @@ class fesom_c_station(object):
         ncf = Dataset(fname,'r')
         mtime_raw = ncf.variables['time'][:]
         a = ncf.variables['time'].getncattr('units')
-        self.mtime = num2date(mtime_raw,a)   
+        self.mcftime = num2date(mtime_raw,a)   
+        self.mtime = [datetime.datetime(year=b.year,month=b.month,day=b.day,
+                                        hour=b.hour,minute=b.minute,second=b.second,
+                                        microsecond=b.microsecond) for b in self.mcftime]
         self.mtimec = np.array([t.timestamp() for t in self.mtime])
         self.sigma_lev = loadvar('sigma_lev') # sigma levels
         self.depth = loadvar('depth') #depth on node
@@ -552,7 +761,7 @@ class fesom_c_station(object):
         #axes.invert_yaxis()
         fig.autofmt_xdate()
         axes.autoscale_view()                
-        return {'fig': fig, 'axes':axes, 'plot':od}
+        return {'fig': fig, 'axes':axes, 'plot':od, 'data':data}
 
     def plotsigmas(self,var,sigmas,figsize=(12, 14),dpi=90,**kwargs):
         # make a plot of variable on defined sigma level
